@@ -5,11 +5,22 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, Field
 import os
 from pathlib import Path
+
+from src.teacher_auth import (
+    SESSION_COOKIE_NAME,
+    SESSION_TTL_SECONDS,
+    authenticate_teacher,
+    create_session,
+    current_teacher,
+    require_teacher,
+    session_cookie_secure,
+)
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -78,6 +89,11 @@ activities = {
 }
 
 
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=1024)
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
@@ -88,9 +104,63 @@ def get_activities():
     return activities
 
 
+@app.get("/auth/session")
+def get_teacher_session(request: Request):
+    session = current_teacher(request)
+    if session is None:
+        return {"authenticated": False}
+    return {
+        "authenticated": True,
+        "username": session["username"],
+        "csrf_token": session["csrf"],
+    }
+
+
+@app.post("/auth/login")
+def login(credentials: LoginRequest, response: Response):
+    if not authenticate_teacher(credentials.username, credentials.password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token, csrf_token = create_session(credentials.username)
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=session_cookie_secure(),
+        samesite="lax",
+        path="/",
+    )
+    return {"username": credentials.username, "csrf_token": csrf_token}
+
+
+@app.post("/auth/logout")
+def logout(
+    request: Request,
+    response: Response,
+    csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
+):
+    require_teacher(request, csrf_token)
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        httponly=True,
+        secure=session_cookie_secure(),
+        samesite="lax",
+        path="/",
+    )
+    return {"message": "Signed out"}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    request: Request,
+    csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
+):
     """Sign up a student for an activity"""
+    require_teacher(request, csrf_token)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +181,15 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    request: Request,
+    csrf_token: str | None = Header(default=None, alias="X-CSRF-Token"),
+):
     """Unregister a student from an activity"""
+    require_teacher(request, csrf_token)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
